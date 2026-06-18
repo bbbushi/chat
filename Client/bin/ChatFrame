@@ -1,0 +1,190 @@
+import javax.swing.*;
+import java.awt.*;
+import java.awt.event.*;
+import java.io.*;
+import java.net.Socket;
+import java.util.List;
+
+public class ChatFrame extends JFrame {
+    private Socket socket;
+    private ObjectOutputStream out;
+    private ObjectInputStream in;
+    private String username;
+
+    private JTextArea txtChat;
+    private JTextField txtInput;
+    private JButton btnSend;
+    private DefaultListModel<String> onlineListModel;
+    private JList<String> onlineList;
+    private JButton btnRefresh;
+    private JButton btnPrivate;
+
+    private boolean running = true;
+
+    public ChatFrame(Socket socket, ObjectOutputStream out, ObjectInputStream in, String username) {
+        this.socket = socket;
+        this.out = out;
+        this.in = in;
+        this.username = username;
+        initUI();
+        startReceiving();
+        // 请求在线用户列表
+        sendMessage("get_online_users", null, null);
+    }
+
+    private void initUI() {
+        setTitle("聊天室 - " + username);
+        setSize(600, 500);
+        setDefaultCloseOperation(JFrame.DO_NOTHING_ON_CLOSE);
+        setLocationRelativeTo(null);
+        setLayout(null);
+
+        txtChat = new JTextArea();
+        txtChat.setEditable(false);
+        txtChat.setLineWrap(true);
+        JScrollPane chatScroll = new JScrollPane(txtChat);
+        chatScroll.setBounds(10, 10, 420, 380);
+        add(chatScroll);
+
+        onlineListModel = new DefaultListModel<>();
+        onlineList = new JList<>(onlineListModel);
+        JScrollPane userScroll = new JScrollPane(onlineList);
+        userScroll.setBounds(440, 10, 140, 300);
+        add(userScroll);
+
+        btnRefresh = new JButton("刷新用户");
+        btnRefresh.setBounds(440, 320, 140, 30);
+        add(btnRefresh);
+        btnPrivate = new JButton("私聊");
+        btnPrivate.setBounds(440, 360, 140, 30);
+        add(btnPrivate);
+
+        txtInput = new JTextField();
+        txtInput.setBounds(10, 400, 420, 30);
+        add(txtInput);
+        btnSend = new JButton("发送");
+        btnSend.setBounds(440, 400, 140, 30);
+        add(btnSend);
+
+        btnRefresh.addActionListener(e -> sendMessage("get_online_users", null, null));
+        btnPrivate.addActionListener(e -> startPrivateChat());
+        btnSend.addActionListener(e -> sendChat());
+        txtInput.addActionListener(e -> sendChat());
+        onlineList.addMouseListener(new MouseAdapter() {
+            public void mouseClicked(MouseEvent e) {
+                if (e.getClickCount() == 2) startPrivateChat();
+            }
+        });
+
+        addWindowListener(new WindowAdapter() {
+            public void windowClosing(WindowEvent e) {
+                logout();
+            }
+        });
+    }
+
+    private void startPrivateChat() {
+        String target = onlineList.getSelectedValue();
+        if (target == null) {
+            JOptionPane.showMessageDialog(this, "请先从在线用户列表中选择一个用户", "提示", JOptionPane.INFORMATION_MESSAGE);
+            return;
+        }
+        String message = JOptionPane.showInputDialog(this, "发送给 " + target + ":", "私聊", JOptionPane.PLAIN_MESSAGE);
+        if (message != null && !message.trim().isEmpty()) {
+            sendMessage("private_chat", target, message);
+        }
+    }
+
+    private void sendChat() {
+        String text = txtInput.getText().trim();
+        if (text.isEmpty()) return;
+        if (text.startsWith("/private ")) {
+            String[] parts = text.split(" ", 3);
+            if (parts.length >= 3) {
+                sendMessage("private_chat", parts[1], parts[2]);
+            } else {
+                appendChat("系统提示: 私聊格式错误，正确格式: /private 用户名 消息", true);
+            }
+        } else {
+            sendMessage("chat", null, text);
+        }
+        txtInput.setText("");
+    }
+
+    private void sendMessage(String type, String target, String content) {
+        try {
+            Message msg = new Message();
+            msg.setType(type);
+            if (target != null) msg.setTarget(target);
+            if (content != null) msg.setContent(content);
+            out.writeObject(msg);
+            out.flush();
+        } catch (IOException e) {
+            appendChat("发送失败，连接可能已断开", true);
+        }
+    }
+
+    private void startReceiving() {
+        new Thread(() -> {
+            while (running) {
+                try {
+                    Message msg = (Message) in.readObject();
+                    if (msg == null) break;
+                    switch (msg.getType()) {
+                        case "chat":
+                            appendChat(msg.getFrom() + ": " + msg.getContent(), false);
+                            break;
+                        case "private":
+                            appendChat("[私聊] " + msg.getFrom() + ": " + msg.getContent(), false);
+                            break;
+                        case "system":
+                            appendChat("【系统】" + msg.getMessageText(), true);
+                            break;
+                        case "online_list":
+                            updateOnlineList(msg.getUsers());
+                            break;
+                    }
+                } catch (IOException | ClassNotFoundException e) {
+                    if (running) {
+                        appendChat("与服务器的连接已断开", true);
+                        running = false;
+                        SwingUtilities.invokeLater(() -> {
+                            JOptionPane.showMessageDialog(this, "连接已断开", "错误", JOptionPane.ERROR_MESSAGE);
+                            logout();
+                        });
+                    }
+                    break;
+                }
+            }
+        }).start();
+    }
+
+    private void appendChat(String text, boolean isSystem) {
+        SwingUtilities.invokeLater(() -> {
+            txtChat.append(text + "\n");
+            txtChat.setCaretPosition(txtChat.getDocument().getLength());
+        });
+    }
+
+    private void updateOnlineList(List<String> users) {
+        SwingUtilities.invokeLater(() -> {
+            onlineListModel.clear();
+            for (String user : users) {
+                if (!user.equals(username)) {
+                    onlineListModel.addElement(user);
+                }
+            }
+        });
+    }
+
+    private void logout() {
+        running = false;
+        try {
+            sendMessage("logout", null, null);
+            out.close();
+            in.close();
+            socket.close();
+        } catch (IOException e) {}
+        System.exit(0);
+    }
+}

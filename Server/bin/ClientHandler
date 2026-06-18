@@ -1,0 +1,231 @@
+import java.io.*;
+import java.net.Socket;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+
+public class ClientHandler implements Runnable {
+    private Socket socket;
+    private ObjectInputStream input;
+    private ObjectOutputStream output;
+    private String currentUser;
+    
+    // 共享数据（从 Server 传入）
+    private static Map<String, UserInfo> users;
+    private static Map<String, ClientHandler> onlineHandlers;
+    private static Object userLock = new Object();
+    private static Object onlineLock = new Object();
+    private static String userFile = "users.dat";
+
+    static {
+        users = new ConcurrentHashMap<>();
+        onlineHandlers = new ConcurrentHashMap<>();
+        loadUsers();
+    }
+
+    public ClientHandler(Socket socket) {
+        this.socket = socket;
+        try {
+            output = new ObjectOutputStream(socket.getOutputStream());
+            input = new ObjectInputStream(socket.getInputStream());
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private static void loadUsers() {
+        File file = new File(userFile);
+        if (file.exists()) {
+            try (ObjectInputStream ois = new ObjectInputStream(new FileInputStream(file))) {
+                Map<String, UserInfo> loaded = (Map<String, UserInfo>) ois.readObject();
+                users.putAll(loaded);
+                // 清除客户端的 Socket 引用（因为反序列化后为 null）
+                for (UserInfo ui : users.values()) {
+                    ui.setClientSocket(null);
+                }
+            } catch (Exception e) {
+                e.printStackTrace();
+            }
+        }
+    }
+
+    private static void saveUsers() {
+        try (ObjectOutputStream oos = new ObjectOutputStream(new FileOutputStream(userFile))) {
+            oos.writeObject(users);
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+
+    private static String hashPassword(String password) {
+        try {
+            MessageDigest md = MessageDigest.getInstance("SHA-256");
+            byte[] hash = md.digest(password.getBytes());
+            return Base64.getEncoder().encodeToString(hash);
+        } catch (NoSuchAlgorithmException e) {
+            e.printStackTrace();
+            return null;
+        }
+    }
+
+    private void sendMessage(Message msg) {
+        try {
+            output.writeObject(msg);
+            output.flush();
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+
+    private void broadcast(Message msg, ClientHandler exclude) {
+        synchronized (onlineLock) {
+            for (ClientHandler handler : onlineHandlers.values()) {
+                if (handler != exclude) {
+                    handler.sendMessage(msg);
+                }
+            }
+        }
+    }
+
+    private void updateOnlineListFor(ClientHandler handler) {
+        List<String> onlineList = new ArrayList<>();
+        synchronized (onlineLock) {
+            onlineList.addAll(onlineHandlers.keySet());
+        }
+        Message msg = new Message();
+        msg.setType("online_list");
+        msg.setUsers(onlineList);
+        handler.sendMessage(msg);
+    }
+
+    @Override
+    public void run() {
+        try {
+            while (true) {
+                Message msg = (Message) input.readObject();
+                if (msg == null) break;
+
+                switch (msg.getType()) {
+                    case "register":
+                        synchronized (userLock) {
+                            if (users.containsKey(msg.getUsername())) {
+                                Message resp = new Message();
+                                resp.setType("register_response");
+                                resp.setSuccess(false);
+                                resp.setMessageText("用户名已存在");
+                                sendMessage(resp);
+                            } else {
+                                UserInfo ui = new UserInfo();
+                                ui.setPasswordHash(hashPassword(msg.getPassword()));
+                                users.put(msg.getUsername(), ui);
+                                saveUsers();
+                                Message resp = new Message();
+                                resp.setType("register_response");
+                                resp.setSuccess(true);
+                                resp.setMessageText("注册成功");
+                                sendMessage(resp);
+                            }
+                        }
+                        break;
+
+                    case "login":
+                        synchronized (userLock) {
+                            UserInfo ui = users.get(msg.getUsername());
+                            if (ui == null || !ui.getPasswordHash().equals(hashPassword(msg.getPassword()))) {
+                                Message resp = new Message();
+                                resp.setType("login_response");
+                                resp.setSuccess(false);
+                                resp.setMessageText("用户名或密码错误");
+                                sendMessage(resp);
+                            } else if (onlineHandlers.containsKey(msg.getUsername())) {
+                                Message resp = new Message();
+                                resp.setType("login_response");
+                                resp.setSuccess(false);
+                                resp.setMessageText("用户已在别处登录");
+                                sendMessage(resp);
+                            } else {
+                                currentUser = msg.getUsername();
+                                ui.setClientSocket(socket);
+                                synchronized (onlineLock) {
+                                    onlineHandlers.put(currentUser, this);
+                                }
+                                Message resp = new Message();
+                                resp.setType("login_response");
+                                resp.setSuccess(true);
+                                resp.setMessageText("登录成功");
+                                sendMessage(resp);
+                                // 广播加入消息
+                                Message joinMsg = new Message();
+                                joinMsg.setType("system");
+                                joinMsg.setMessageText(currentUser + " 加入聊天室");
+                                broadcast(joinMsg, this);
+                                // 发送在线列表给新用户
+                                updateOnlineListFor(this);
+                            }
+                        }
+                        break;
+
+                    case "chat":
+                        if (currentUser != null) {
+                            Message chatMsg = new Message();
+                            chatMsg.setType("chat");
+                            chatMsg.setFrom(currentUser);
+                            chatMsg.setContent(msg.getContent());
+                            broadcast(chatMsg, null);
+                        }
+                        break;
+
+                    case "private_chat":
+                        if (currentUser != null) {
+                            ClientHandler targetHandler;
+                            synchronized (onlineLock) {
+                                targetHandler = onlineHandlers.get(msg.getTarget());
+                            }
+                            if (targetHandler != null) {
+                                Message privateMsg = new Message();
+                                privateMsg.setType("private");
+                                privateMsg.setFrom(currentUser);
+                                privateMsg.setContent(msg.getContent());
+                                targetHandler.sendMessage(privateMsg);
+                            } else {
+                                Message errorMsg = new Message();
+                                errorMsg.setType("system");
+                                errorMsg.setMessageText("无法发送私聊给 " + msg.getTarget() + "，对方不在线");
+                                sendMessage(errorMsg);
+                            }
+                        }
+                        break;
+
+                    case "get_online_users":
+                        if (currentUser != null) {
+                            updateOnlineListFor(this);
+                        }
+                        break;
+
+                    case "logout":
+                        return;
+                }
+            }
+        } catch (IOException | ClassNotFoundException e) {
+            e.printStackTrace();
+        } finally {
+            // 清理资源
+            if (currentUser != null) {
+                synchronized (onlineLock) {
+                    onlineHandlers.remove(currentUser);
+                }
+                synchronized (userLock) {
+                    UserInfo ui = users.get(currentUser);
+                    if (ui != null) ui.setClientSocket(null);
+                }
+                Message leaveMsg = new Message();
+                leaveMsg.setType("system");
+                leaveMsg.setMessageText(currentUser + " 离开了聊天室");
+                broadcast(leaveMsg, this);
+            }
+            try { socket.close(); } catch (IOException e) {}
+        }
+    }
+}

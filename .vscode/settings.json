@@ -1,0 +1,16 @@
+{
+    "git.ignoreLimitWarning": true,
+    "background.fullscreen": {
+        
+
+    
+        
+        
+        "images": ["file:///Users/huziyao/Downloads/b5de1e004a90f60360cd6e547f12b31bb051ed06.jpg"],
+        "opacity": 0.15,
+        "size": "cover",
+        "position": "center",
+        "interval": 0,
+        "random": false
+    }
+}
